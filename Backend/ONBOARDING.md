@@ -238,6 +238,7 @@ only the most recent binding.
 | **Identity hijacking** | Dual-signature: attacker needs both nsec AND CDP Smart Account access simultaneously |
 | **Address impersonation** | EVM consent signature requires passkey/OAuth interaction — cannot be automated |
 | **Relay spam / fake bindings** | Backend ignores events not backed by a valid ERC-1271 signature |
+| **RPC provider outage** | Three-tier fallback transport (primary → secondary → public) ensures ERC-1271 calls survive single-provider failures |
 | **CDP session compromise** | nsec encrypted with WebAuthn PRF, not derived from CDP session |
 | **Server-side key exposure** | Server never handles private keys; only public keys and signatures travel to backend |
 | **Device clock drift** | The 5-minute window tolerates typical NTP drift, but devices with manually-set clocks that are off by more than 5 minutes will fail onboarding. The client should fetch server time before generating the payload if clock accuracy cannot be assumed (common on mobile). |
@@ -386,11 +387,14 @@ and Edge runtimes. The main `nostr-tools` export pulls in browser-specific code.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `NEXT_PUBLIC_BASE_CHAIN_ID` | No | `84532` | `"8453"` for mainnet, `"84532"` for Sepolia. **Any other value causes a startup error** (validated in `lib/evm/client.ts`). |
-| `BASE_RPC_URL` | Recommended | Public endpoint | Private RPC URL for production |
+| `BASE_RPC_URL` | Recommended | — | Primary Alchemy RPC URL. If absent, the transport chain starts at `BASE_RPC_FALLBACK_URL`. |
+| `BASE_RPC_FALLBACK_URL` | Optional | — | Secondary RPC (backup Alchemy key, QuickNode, etc.). Tried if `BASE_RPC_URL` is unreachable. |
 | `NEXT_PUBLIC_CDP_PROJECT_ID` | Yes (client) | — | CDP project identifier |
 | `NEXT_PUBLIC_CDP_APP_NAME` | Yes (client) | — | CDP application name |
 | `NEXT_PUBLIC_DEFAULT_RELAYS` | No (client) | damus/nos.lol | Comma-separated Nostr relay WSS URLs |
 
-> **Production note:** Always set `BASE_RPC_URL` to a private RPC provider
-> (Alchemy, QuickNode, etc.) in production. The public Base endpoints are
-> rate-limited and unsuitable for ERC-1271 verification at scale.
+> **Production note:** Always set `BASE_RPC_URL` (and optionally `BASE_RPC_FALLBACK_URL`)
+> to private RPC providers (Alchemy, QuickNode, etc.). The public Base endpoints are
+> rate-limited and unsuitable for ERC-1271 verification at scale. The fallback transport
+> chain means a single provider outage no longer causes all EVM signature verifications
+> to fail; viem automatically advances to the next reachable transport.

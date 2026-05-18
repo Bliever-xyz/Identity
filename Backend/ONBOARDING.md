@@ -238,6 +238,7 @@ only the most recent binding.
 | **Identity hijacking** | Dual-signature: attacker needs both nsec AND CDP Smart Account access simultaneously |
 | **Address impersonation** | EVM consent signature requires passkey/OAuth interaction — cannot be automated |
 | **Relay spam / fake bindings** | Backend ignores events not backed by a valid ERC-1271 signature |
+| **Endpoint abuse / DoS** | Per-IP rate limiting (10 req/min) on write endpoints blocks cheap flooding before any cryptographic work is done |
 | **RPC provider outage** | Three-tier fallback transport (primary → secondary → public) ensures ERC-1271 calls survive single-provider failures |
 | **CDP session compromise** | nsec encrypted with WebAuthn PRF, not derived from CDP session |
 | **Server-side key exposure** | Server never handles private keys; only public keys and signatures travel to backend |
@@ -379,6 +380,21 @@ fields would remove that cross-layer guarantee.
 
 The `/pure` sub-path export has no DOM dependencies, making it safe in Node.js
 and Edge runtimes. The main `nostr-tools` export pulls in browser-specific code.
+
+### Decision: In-memory rate limiter on write endpoints
+
+`/api/bind-identity` and `/api/onboarding` enforce a per-IP sliding-window limit
+(10 requests per 60 seconds) using a module-level `Map`.
+
+**Why:** The ERC-1271 verification at step 9 requires an outbound RPC call.
+Without a gate, a flood of syntactically valid-looking requests could exhaust
+RPC quota before the validator rejects them on cryptographic grounds. Catching
+abuse before step 1 (timestamp check) costs nothing and protects the RPC budget.
+
+**Trade-off:** The in-memory store is not shared across process instances. Each
+instance maintains its own counter, so the effective cap in a multi-instance
+deployment is `RL_MAX_REQUESTS × instances`. Replace the store with Redis
+(e.g. Upstash) before horizontal scaling.
 
 ---
 

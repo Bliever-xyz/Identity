@@ -67,6 +67,12 @@ Server-side modules (`lib/evm/`, server-side `lib/nostr/verification.ts`) are
 > PRF operations use `window.crypto.subtle` (built into every modern browser and
 > the Node.js `crypto` global from v19).
 
+> **Client-only constraint.** `flow.ts`, `nsec-storage.ts`, and `relay.ts` all carry a
+> `"use client"` directive. In Next.js, this prevents the bundler from including them
+> in any server component or server action. In non-Next.js apps, never `import` these
+> modules inside a file that runs on Node/SSR — use dynamic import (`const mod = await import("…")`)
+> inside a browser-only code path instead.
+
 ### Sub-path import note
 
 ```ts
@@ -241,7 +247,7 @@ The server's `checkNostrEventStructure` validates the presence of all three tags
 interface RelayPublishOutcome {
   url: string;
   success: boolean;
-  error?: string;       // reason if success === false
+  error?: string;       // reason if success === false (final attempt)
 }
 
 interface PublishResult {
@@ -252,15 +258,17 @@ interface PublishResult {
 async function publishEventToRelays(
   event: NostrBindingEvent,
   relayUrls: string[],
-  timeoutMs?: number,    // default 8_000 ms per relay
+  timeoutMs?: number,    // default 8_000 ms per attempt per relay
+  maxRetries?: number,   // default 2 — additional attempts after initial failure
 ): Promise<PublishResult>
 ```
 
 **Implementation details:**
 
 - Each relay gets its own `Promise` via `Relay.connect(url)` from nostr-tools.
-- A `setTimeout`-backed race enforces the per-relay timeout independently.
-- `Promise.allSettled` collects every outcome (no early exit on failure).
+- A `setTimeout`-backed race enforces the per-relay timeout per attempt independently.
+- On failure, each relay is retried up to `maxRetries` times with linear backoff (1 s × attempt number). Only the error from the final failed attempt is recorded in `outcomes`.
+- `Promise.allSettled` collects every relay's final outcome (no early exit on failure).
 - Each `Relay` connection is closed in a `finally` block — no persistent sockets.
 - The function never throws; all errors are captured in `outcomes[n].error`.
 
@@ -424,7 +432,7 @@ Full execution sequence:
 | 5 | `buildEVMConsentMessage(…)` | No | Deterministic string builder |
 | 6 | `signMessage(consentMessage)` | CDP prompt | Returns `0x…` EIP-191 sig |
 | 7 | `submitOnboarding(payload)` | Yes | POST /api/onboarding + ERC-1271 RPC |
-| 8 | `publishEventToRelays(…)` | Yes (best-effort) | Failure logs warning, does not throw |
+| 8 | `publishEventToRelays(…)` | Yes (best-effort) | Per-relay retry with linear backoff; failure logs warning, does not throw |
 
 **nsec persistence before signing (step 2 before steps 4–6):**
 
@@ -452,13 +460,13 @@ Differences from `runOnboarding`:
 #### `generateBindingId()` (internal)
 
 ```ts
-// Prefers native crypto.randomUUID() (Chrome 92+, Node 19+, Firefox 95+)
-// Falls back to manual RFC 4122 §4.4 construction via getRandomValues
+// Uses crypto.randomUUID() directly — available on all supported targets:
+// Chrome 92+, Firefox 95+, Safari 15.4+, Node 19+
+// These are the effective minimums because IndexedDB + WebAuthn are required anyway.
+function generateBindingId(): string {
+  return crypto.randomUUID();
+}
 ```
-
-The fallback produces a valid UUID v4:
-- Bytes[6]: version nibble forced to `4`  (`& 0x0f | 0x40`)
-- Bytes[8]: variant forced to `10xx`       (`& 0x3f | 0x80`)
 
 #### `buildDualSignatureProof(…)` (internal shared helper)
 
@@ -769,11 +777,37 @@ try {
 Causes:
 1. User cleared browser data / IndexedDB.
 2. User is on a different device.
-3. User never completed onboarding (persistent step abandoned mid-flow).
+3. User never completed onboarding (nsec stored but CDP prompt was dismissed — see below).
 4. The IDB database name or store name was changed between versions.
 
 Check `hasStoredNsec()` before calling `recoverNsec`. If it returns `false`,
 route the user to re-onboard or restore from an external backup mechanism.
+
+### Orphaned nsec — user abandoned mid-flow
+
+`runOnboarding` writes the nsec to IndexedDB (step 2) before either signature prompt.
+If the user dismisses the CDP wallet prompt or closes the tab after step 2 but before
+the server confirms the binding, an nsec bundle exists in IDB that is not registered
+on the backend.
+
+**Detection:** Call `hasStoredNsec()` at app startup. If it returns `true` but the
+user's backend profile shows no confirmed binding, they are in the orphaned state.
+
+**Recovery options (application decides):**
+
+```ts
+// Option A — route to retry: recover the existing nsec and re-run the signing steps
+//   via runBindIdentity (the key is already stored, no new keypair needed).
+const nsec = await recoverNsec(handle, { rpId: "app.bliever.io" });
+const npub = npubFromNsec(nsec);
+await runBindIdentity({ npub, nsec, evmAddress, signMessage, relayUrls });
+
+// Option B — start fresh: discard the orphaned key and re-onboard
+await clearStoredNsec();
+await runOnboarding({ evmAddress, signMessage, relayUrls, storageStrategy });
+```
+
+Option A is preferable because the user's Nostr identity (npub) is preserved.
 
 ### `invalid_nostr_signature`
 
@@ -785,13 +819,19 @@ route the user to re-onboard or restore from an external backup mechanism.
 
 ### Relay publish fails for all relays
 
-Relay publish failure does NOT fail onboarding. Check `result.nostrEvent` is present
-and re-publish manually:
+Relay publish failure does NOT fail onboarding. Each relay is retried up to 2 times
+(with 1 s and 2 s delays) before being marked as failed in `outcomes`. If every relay
+still fails after retries, re-publish manually using `result.nostrEvent`:
 
 ```ts
 import { publishEventToRelays } from "lib/nostr/relay";
 
+// Default: 2 retries, 8 s timeout per attempt
 const publishResult = await publishEventToRelays(result.nostrEvent, relayUrls);
+
+// Or increase retries and timeout for very slow connections:
+const publishResult = await publishEventToRelays(result.nostrEvent, relayUrls, 12_000, 4);
+
 console.log(publishResult.outcomes);
 ```
 

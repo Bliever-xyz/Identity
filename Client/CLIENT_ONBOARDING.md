@@ -161,7 +161,16 @@ same `bindingId` (UUID v4) and `timestamp`. This is the binding glue.
 
 ### Proof A — Nostr Claim (Schnorr signature)
 
-The client builds a Kind 30078 Nostr event whose JSON `content` contains:
+Before any hashing, `buildAndSignBindingEvent` runs two local guards:
+
+- **npub/nsec consistency:** `getPublicKey(nsec)` is derived and compared to the
+  provided `npub`. A mismatch throws immediately, preventing a valid-looking Schnorr
+  signature that the server would reject as `nostr_pubkey_mismatch`.
+- **evmAddress format:** The address is tested against `/^0x[0-9a-fA-F]{40}$/`. A
+  malformed address throws immediately, avoiding an `evm_address_invalid` server
+  rejection and an unnecessary ERC-1271 RPC call.
+
+The client then builds a Kind 30078 Nostr event whose JSON `content` contains:
 
 ```jsonc
 {
@@ -232,6 +241,9 @@ reference an identical UUID before accepting the binding.
 | **User cancels CDP prompt** | nsec is persisted BEFORE signing — key is safe even on abort |
 | **Replay attack** | 5-minute timestamp window on the server; bindingId is single-use |
 | **Clock skew (mobile)** | Timestamp sourced from `Date.now()` — server has 300s tolerance |
+| **Key mismatch (npub/nsec)** | `buildAndSignBindingEvent` derives the public key from nsec and compares it to the provided npub before signing — throws locally on mismatch |
+| **Corrupted nsec bytes** | `npubFromNsec` validates `nsec.length === 32` before passing to the cryptographic layer |
+| **Malformed evmAddress** | `buildAndSignBindingEvent` tests the address format before building the event |
 | **Relay failure** | Best-effort publish; server confirmation is the source of truth |
 
 ---
@@ -438,18 +450,24 @@ A React consumer passes `useSignMessage()` from `@coinbase/cdp-hooks`. A test
 passes a mock that returns a fixed hex string. Neither change requires modifying
 `flow.ts`.
 
-### Decision: Relay Publication is Best-Effort with Per-Relay Retry
+### Decision: Relay Publication is Best-Effort with Transient-Only Retry
 
 After the server confirms the binding, `publishEventToRelays` is called but its
-result does not gate `OnboardingResult`. Each relay is retried up to 2 times with
-linear backoff before being marked failed. A zero-success result logs a warning
-but does not throw.
+result does not gate `OnboardingResult`. A single timeout budget covers the
+entire attempt per relay — both the connect and the publish — so a relay that
+accepts the connection but then goes silent cannot hang its slot. Each relay is
+retried up to 2 times with linear backoff, but **only when the error is
+transient** (timeout, network drop, WebSocket close). Permanent relay rejections
+such as `BAD EVENT`, `blocked`, or `duplicate` fail immediately without retrying
+— they cannot succeed on re-attempt and would waste the backoff delay. A
+zero-success result logs a warning but does not throw.
 
 **Why:** The source of truth for the binding is the server's confirmation (and
 the indexer's storage of the response). Relays are the discovery layer; their
 availability should not be a hard dependency of onboarding. The retry layer absorbs
 transient failures — common on mobile connections — without exposing retry complexity
-to the consumer.
+to the consumer. Skipping retries on permanent errors avoids unnecessary UX delay
+when a relay has definitively rejected the event.
 
 **Trade-off:** A user whose event reaches zero relays after all retries will be
 undiscoverable via relay queries until re-publication is attempted. The `nostrEvent`

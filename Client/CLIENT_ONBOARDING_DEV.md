@@ -182,6 +182,8 @@ function generateNostrKeypair(): NostrKeypair
 
 function npubFromNsec(nsec: Uint8Array): string
 // Derives the hex public key from a raw secret key.
+// Throws immediately if nsec.length !== 32 — catches truncated or
+// corrupted key material before it reaches the cryptographic layer.
 // Used after recovering nsec from storage.
 
 // Binary encoding (used by nsec-storage.ts)
@@ -202,8 +204,8 @@ of spreading the full array, preventing a stack overflow on large buffers.
 
 ```ts
 interface BuildBindingEventParams {
-  npub: string;        // for intent documentation; finalizeEvent derives it from nsec
-  evmAddress: string;  // EIP-55 checksummed
+  npub: string;        // validated: getPublicKey(nsec) must equal this value
+  evmAddress: string;  // validated: must match /^0x[0-9a-fA-F]{40}$/
   bindingId: string;   // UUID v4
   timestamp: number;   // unix seconds
   nsec: Uint8Array;    // 32-byte secret key — used by finalizeEvent
@@ -211,6 +213,11 @@ interface BuildBindingEventParams {
 
 function buildAndSignBindingEvent(params: BuildBindingEventParams): NostrBindingEvent
 ```
+
+**Input guards (run before any signing):**
+
+- **npub/nsec consistency:** `getPublicKey(nsec)` is derived and compared against the provided `npub`. A mismatch throws immediately with a descriptive message, catching caller key-mix-up bugs before they produce a valid-looking Schnorr signature that the server rejects as `nostr_pubkey_mismatch`.
+- **evmAddress format:** The address is tested against `/^0x[0-9a-fA-F]{40}$/`. A malformed address throws immediately, preventing an `evm_address_invalid` server rejection that would waste the EVM signing step and an ERC-1271 RPC call.
 
 **What `finalizeEvent` does internally:**
 
@@ -258,7 +265,7 @@ interface PublishResult {
 async function publishEventToRelays(
   event: NostrBindingEvent,
   relayUrls: string[],
-  timeoutMs?: number,    // default 8_000 ms per attempt per relay
+  timeoutMs?: number,    // default 8_000 ms — covers connect AND publish per attempt
   maxRetries?: number,   // default 2 — additional attempts after initial failure
 ): Promise<PublishResult>
 ```
@@ -266,8 +273,9 @@ async function publishEventToRelays(
 **Implementation details:**
 
 - Each relay gets its own `Promise` via `Relay.connect(url)` from nostr-tools.
-- A `setTimeout`-backed race enforces the per-relay timeout per attempt independently.
-- On failure, each relay is retried up to `maxRetries` times with linear backoff (1 s × attempt number). Only the error from the final failed attempt is recorded in `outcomes`.
+- A single `timeoutMs` budget covers the **entire** attempt: both `Relay.connect()` and `relay.publish()`. A single `setTimeout`-backed `timeoutPromise` is created per attempt and raced against both operations in sequence. The timer handle is always cleared in the `finally` block to prevent dangling timers.
+- On failure, retries fire **only for transient errors** matching `/timeout|network|websocket/i`. Permanent relay rejections (e.g. `BAD EVENT`, `blocked`, `duplicate`) break the retry loop immediately — retrying them cannot succeed and wastes the linear-backoff delay.
+- Transient retries use linear backoff: 1 s × attempt number. Only the error from the final failed attempt is recorded in `outcomes`.
 - `Promise.allSettled` collects every relay's final outcome (no early exit on failure).
 - Each `Relay` connection is closed in a `finally` block — no persistent sockets.
 - The function never throws; all errors are captured in `outcomes[n].error`.
@@ -604,6 +612,9 @@ if (result.valid) {
 | Error type | When | `reason` / message |
 |---|---|---|
 | `Error` | `persistNsec` fails (IDB error, PRF unsupported) | Descriptive message, no `reason` |
+| `Error` | nsec length !== 32 (`npubFromNsec`) | Descriptive message, no `reason` |
+| `Error` | nsec/npub mismatch (`buildAndSignBindingEvent`) | Descriptive message, no `reason` |
+| `Error` | malformed evmAddress (`buildAndSignBindingEvent`) | Descriptive message, no `reason` |
 | `Error` | nsec/npub mismatch (runBindIdentity only) | Descriptive message |
 | `OnboardingApiError` | Server returns 400 | See table below |
 | `OnboardingApiError` | Server returns 429 | `"rate_limited"`, `status: 429` |
@@ -815,13 +826,13 @@ Option A is preferable because the user's Nostr identity (npub) is preserved.
    custom implementation).
 2. Verify `content = JSON.stringify(claim)` is called **before** `finalizeEvent`.
 3. Verify the `nsec` passed to `buildAndSignBindingEvent` corresponds to the `npub`
-   submitted in the payload. Use `npubFromNsec(nsec) === npub` to check.
+   submitted in the payload. `buildAndSignBindingEvent` now derives `getPublicKey(nsec)`
+   and compares it to `npub` before hashing — a mismatch throws locally rather than
+   producing a server-rejected event.
 
 ### Relay publish fails for all relays
 
-Relay publish failure does NOT fail onboarding. Each relay is retried up to 2 times
-(with 1 s and 2 s delays) before being marked as failed in `outcomes`. If every relay
-still fails after retries, re-publish manually using `result.nostrEvent`:
+Relay publish failure does NOT fail onboarding. Each relay is retried up to 2 times (with 1 s and 2 s delays) **only for transient errors** (timeout, network drop, WebSocket close). Permanent relay rejections such as `BAD EVENT` or `blocked` fail immediately on that relay without consuming the backoff delay. If every relay still fails, re-publish manually using `result.nostrEvent`:
 
 ```ts
 import { publishEventToRelays } from "lib/nostr/relay";

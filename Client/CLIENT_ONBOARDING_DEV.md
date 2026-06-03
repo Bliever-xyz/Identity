@@ -242,7 +242,7 @@ tags: [
 ]
 ```
 
-The server's `checkNostrEventStructure` validates the presence of all three tags.
+The server's `checkNostrEventStructure` validates the presence and non-empty values of all three tags. The full validator additionally cross-checks the `binding` and `evm` tag values against the submitted `bindingId` and `evmAddress`.
 
 ---
 
@@ -272,11 +272,12 @@ async function publishEventToRelays(
 
 **Implementation details:**
 
-- Each relay gets its own `Promise` via `Relay.connect(url)` from nostr-tools.
+- URLs are validated before any connection attempt. Any URL that does not parse as a `wss://` or `ws://` address receives an immediate failure outcome — its error is recorded and it is never passed to `Relay.connect()`. This prevents an 8-second timeout per malformed URL that would otherwise be wasted on a locally-detectable mistake (e.g. `http://` prefix or a bare hostname).
+- Each valid relay gets its own `Promise` via `Relay.connect(url)` from nostr-tools.
 - A single `timeoutMs` budget covers the **entire** attempt: both `Relay.connect()` and `relay.publish()`. A single `setTimeout`-backed `timeoutPromise` is created per attempt and raced against both operations in sequence. The timer handle is always cleared in the `finally` block to prevent dangling timers.
 - On failure, retries fire **only for transient errors** matching `/timeout|network|websocket/i`. Permanent relay rejections (e.g. `BAD EVENT`, `blocked`, `duplicate`) break the retry loop immediately — retrying them cannot succeed and wastes the linear-backoff delay.
 - Transient retries use linear backoff: 1 s × attempt number. Only the error from the final failed attempt is recorded in `outcomes`.
-- `Promise.allSettled` collects every relay's final outcome (no early exit on failure).
+- `Promise.allSettled` collects every valid relay's final outcome (no early exit on failure).
 - Each `Relay` connection is closed in a `finally` block — no persistent sockets.
 - The function never throws; all errors are captured in `outcomes[n].error`.
 
@@ -832,7 +833,7 @@ Option A is preferable because the user's Nostr identity (npub) is preserved.
 
 ### Relay publish fails for all relays
 
-Relay publish failure does NOT fail onboarding. Each relay is retried up to 2 times (with 1 s and 2 s delays) **only for transient errors** (timeout, network drop, WebSocket close). Permanent relay rejections such as `BAD EVENT` or `blocked` fail immediately on that relay without consuming the backoff delay. If every relay still fails, re-publish manually using `result.nostrEvent`:
+Relay publish failure does NOT fail onboarding. URLs are validated before any connection attempt: any URL that does not parse as `wss://` or `ws://` receives an immediate failure outcome without consuming a timeout slot. Each valid relay is retried up to 2 times (with 1 s and 2 s delays) **only for transient errors** (timeout, network drop, WebSocket close). Permanent relay rejections such as `BAD EVENT` or `blocked` fail immediately on that relay without consuming the backoff delay. If every relay still fails, re-publish manually using `result.nostrEvent`:
 
 ```ts
 import { publishEventToRelays } from "lib/nostr/relay";
@@ -846,8 +847,7 @@ const publishResult = await publishEventToRelays(result.nostrEvent, relayUrls, 1
 console.log(publishResult.outcomes);
 ```
 
-Common causes: relay offline, WebSocket blocked by corporate firewall, relay requires
-NIP-42 authentication. Add more relay URLs for resilience.
+Common causes: malformed URL (http:// instead of wss://), relay offline, WebSocket blocked by corporate firewall, relay requires NIP-42 authentication. Check `outcomes[n].error` — invalid URLs are identified immediately with a descriptive message rather than a timeout. Add more relay URLs for resilience.
 
 ### Rate limit (429) during development / automated testing
 

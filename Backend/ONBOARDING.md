@@ -203,10 +203,13 @@ Signed by: CDP Smart Account (ERC-1271)
 Step 3 — Backend verifies both, returns acknowledgement
 ────────────────────────────────────────────────────────
 Server checks:
+  ✓ Timestamp within 5-minute window
+  ✓ nostrEvent.created_at === payload.timestamp (prevents old-event replay)
+  ✓ binding and evm tag values match the submitted payload fields
+  ✓ npub is 64-char hex (not bech32)
   ✓ Nostr Schnorr signature valid
   ✓ EVM ERC-1271 signature valid
   ✓ Both reference same bindingId and timestamp
-  ✓ Timestamp within 5-minute window
 Returns: { success: true, bindingId, npub, evmAddress, verifiedAt }
 ```
 
@@ -234,7 +237,7 @@ only the most recent binding.
 | Attack | Mitigation |
 |--------|-----------|
 | **XSS steals session token** | Session token never used as an encryption key; nsec encrypted with WebAuthn PRF (device-bound key) |
-| **Replay attack** | 5-minute timestamp window + unique `bindingId` |
+| **Replay attack** | 5-minute timestamp window + unique `bindingId` + `created_at` === `timestamp` cross-check (prevents reusing a valid old event with a fresh EVM consent) |
 | **Identity hijacking** | Dual-signature: attacker needs both nsec AND CDP Smart Account access simultaneously |
 | **Address impersonation** | EVM consent signature requires passkey/OAuth interaction — cannot be automated |
 | **Relay spam / fake bindings** | Backend ignores events not backed by a valid ERC-1271 signature |

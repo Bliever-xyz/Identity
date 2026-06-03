@@ -239,11 +239,12 @@ reference an identical UUID before accepting the binding.
 | **XSS steals nsec** | nsec never in JS-accessible plaintext after key generation frame |
 | **IDB profile exfiltrated** | PRF: ciphertext useless without authenticator; WebCrypto: non-extractable key |
 | **User cancels CDP prompt** | nsec is persisted BEFORE signing — key is safe even on abort |
-| **Replay attack** | 5-minute timestamp window on the server; bindingId is single-use |
+| **Replay attack** | 5-minute timestamp window on the server; bindingId is single-use; server cross-checks `created_at` === `timestamp` to block reuse of valid old events |
 | **Clock skew (mobile)** | Timestamp sourced from `Date.now()` — server has 300s tolerance |
 | **Key mismatch (npub/nsec)** | `buildAndSignBindingEvent` derives the public key from nsec and compares it to the provided npub before signing — throws locally on mismatch |
 | **Corrupted nsec bytes** | `npubFromNsec` validates `nsec.length === 32` before passing to the cryptographic layer |
 | **Malformed evmAddress** | `buildAndSignBindingEvent` tests the address format before building the event |
+| **Relay URL misconfiguration** | `publishEventToRelays` validates that each URL parses as `wss://` or `ws://` before attempting a connection — malformed URLs fail immediately without consuming a timeout slot |
 | **Relay failure** | Best-effort publish; server confirmation is the source of truth |
 
 ---
@@ -453,19 +454,22 @@ passes a mock that returns a fixed hex string. Neither change requires modifying
 ### Decision: Relay Publication is Best-Effort with Transient-Only Retry
 
 After the server confirms the binding, `publishEventToRelays` is called but its
-result does not gate `OnboardingResult`. A single timeout budget covers the
-entire attempt per relay — both the connect and the publish — so a relay that
-accepts the connection but then goes silent cannot hang its slot. Each relay is
-retried up to 2 times with linear backoff, but **only when the error is
-transient** (timeout, network drop, WebSocket close). Permanent relay rejections
-such as `BAD EVENT`, `blocked`, or `duplicate` fail immediately without retrying
-— they cannot succeed on re-attempt and would waste the backoff delay. A
-zero-success result logs a warning but does not throw.
+result does not gate `OnboardingResult`. URLs are validated before any connection
+attempt: any URL that does not parse as a `wss://` or `ws://` address receives an
+immediate failure outcome rather than consuming a full timeout slot. For valid URLs,
+a single timeout budget covers the entire attempt per relay — both the connect and
+the publish — so a relay that accepts the connection but then goes silent cannot hang
+its slot. Each valid relay is retried up to 2 times with linear backoff, but **only
+when the error is transient** (timeout, network drop, WebSocket close). Permanent
+relay rejections such as `BAD EVENT`, `blocked`, or `duplicate` fail immediately
+without retrying — they cannot succeed on re-attempt and would waste the backoff
+delay. A zero-success result logs a warning but does not throw.
 
 **Why:** The source of truth for the binding is the server's confirmation (and
 the indexer's storage of the response). Relays are the discovery layer; their
-availability should not be a hard dependency of onboarding. The retry layer absorbs
-transient failures — common on mobile connections — without exposing retry complexity
+availability should not be a hard dependency of onboarding. Up-front URL validation
+catches misconfigured relay lists immediately. The retry layer absorbs transient
+failures — common on mobile connections — without exposing retry complexity
 to the consumer. Skipping retries on permanent errors avoids unnecessary UX delay
 when a relay has definitively rejected the event.
 

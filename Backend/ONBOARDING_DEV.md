@@ -103,6 +103,7 @@ NOSTR_BINDING_D_TAG       = "identity-binding"
 BINDING_TIMESTAMP_WINDOW_SEC = 300
 APP_ID                    = "bliever-v1"
 BASE_CHAIN_ID             = process.env.NEXT_PUBLIC_BASE_CHAIN_ID ?? "84532"
+NPUB_HEX_REGEX            = /^[0-9a-f]{64}$/  // validates raw hex npub; rejects bech32
 
 // Utility types
 type BaseChainId           = "8453" | "84532"  // prevents invalid chain IDs
@@ -172,7 +173,10 @@ version during a transition period.
 // Returns true if timestamp is within ±BINDING_TIMESTAMP_WINDOW_SEC of now
 function checkTimestamp(timestamp: number): boolean
 
-// Validates Kind, d-tag, binding tag, evm tag
+// Validates Kind, d-tag, and that binding/evm tags exist with non-empty values.
+// Cross-checking tag values against specific payload fields (bindingId, evmAddress)
+// is performed inline in validateBindingPayload (steps 2a and 2b) so this helper
+// can also be called from verify-identity, which carries no bindingId.
 function checkNostrEventStructure(event: NostrBindingEvent): StructureResult
 
 // Parses event.content JSON, validates all required fields are present
@@ -201,7 +205,11 @@ async function validateBindingPayload(
 | Step | Operation | Type | Cost |
 |------|-----------|------|------|
 | 1 | `checkTimestamp` | local | O(1) |
+| 1.5 | `created_at` === `timestamp` cross-check | local | O(1) |
 | 2 | `checkNostrEventStructure` | local | O(tags) |
+| 2a | `binding` tag value === `bindingId` | local | O(tags) |
+| 2b | `evm` tag value matches `evmAddress` (case-insensitive) | local | O(tags) |
+| 2.5 | `npub` 64-char hex format | local | O(1) |
 | 3 | pubkey equality | local | O(1) |
 | 3.5 | `bindingId` UUID v4 format | local | O(1) |
 | 4 | `verifyNostrEvent` | CPU (secp256k1) | ~1ms |
@@ -449,13 +457,49 @@ Math.abs(now - timestamp) <= 300
 // fail → "timestamp_expired"
 ```
 
+**Step 1.5 — `created_at` / timestamp cross-check**
+```ts
+nostrEvent.created_at === timestamp
+// fail → "timestamp_expired"
+```
+Enforces that the Nostr event's `created_at` field equals the top-level `timestamp`.
+Without this check, an attacker could pair a valid old Nostr event (whose Schnorr
+signature still verifies) with a fresh `timestamp` that passes the freshness window.
+The EVM consent message is reconstructed using `timestamp`, not `created_at`, so a
+mismatch between the two would cause the two proofs to silently describe different moments.
+
 **Step 2 — Event structure**
 ```ts
-event.kind === 30078                           // fail → "wrong_event_kind"
-event.tags.find(t => t[0]==="d")?.[1] === "identity-binding"  // fail → "wrong_d_tag"
-event.tags.some(t => t[0]==="binding")         // fail → "missing_binding_tag"
-event.tags.some(t => t[0]==="evm")             // fail → "missing_evm_tag"
+event.kind === 30078                                                      // fail → "wrong_event_kind"
+event.tags.find(t => t[0]==="d")?.[1] === "identity-binding"             // fail → "wrong_d_tag"
+event.tags.find(t => t[0]==="binding")?.[1]  // must be non-empty string  // fail → "missing_binding_tag"
+event.tags.find(t => t[0]==="evm")?.[1]      // must be non-empty string  // fail → "missing_evm_tag"
 ```
+
+**Step 2a — `binding` tag value cross-check**
+```ts
+bindingTagValue === bindingId
+// fail → "binding_id_mismatch"
+```
+The `binding` tag is the relay-queryable copy of the `bindingId`. Checking its value
+here (cheap, local) catches a tampered tag before the Schnorr CPU step.
+
+**Step 2b — `evm` tag value cross-check**
+```ts
+evmTagValue.toLowerCase() === evmAddress.toLowerCase()
+// fail → "evm_address_mismatch"
+```
+The `evm` tag is the relay-queryable copy of the EVM address. Validated
+case-insensitively here; the exact EIP-55 checksum comparison occurs at step 6.
+
+**Step 2.5 — npub hex format**
+```ts
+NPUB_HEX_REGEX.test(npub)   // /^[0-9a-f]{64}$/
+// fail → "invalid_payload"
+```
+Rejects bech32-encoded `npub1…` strings, which pass a presence check but produce
+the misleading `nostr_pubkey_mismatch` error at step 3. Catching the format issue
+here returns `invalid_payload` with a clear implication that the encoding is wrong.
 
 **Step 3 — Pubkey match**
 ```ts
@@ -530,20 +574,20 @@ return { valid: true, normalizedEvmAddress, claim }
 
 | Reason | Step | Cause | Client Action |
 |--------|------|-------|---------------|
-| `invalid_payload` | 0 | Missing required field / invalid JSON | Fix request construction |
-| `timestamp_expired` | 1 | Binding submitted > 5 min after creation | Retry with fresh payload |
+| `invalid_payload` | 0, 2.5 | Missing required field / invalid JSON / non-hex npub | Fix request construction |
+| `timestamp_expired` | 1, 1.5 | Binding submitted > 5 min after creation, or `created_at` ≠ `timestamp` | Retry with fresh payload |
 | `wrong_event_kind` | 2 | `event.kind !== 30078` | Fix event construction |
 | `wrong_d_tag` | 2 | `d` tag ≠ `"identity-binding"` | Fix event tags |
-| `missing_binding_tag` | 2 | No `binding` tag in event | Add `["binding", bindingId]` tag |
-| `missing_evm_tag` | 2 | No `evm` tag in event | Add `["evm", evmAddress]` tag |
+| `missing_binding_tag` | 2 | No `binding` tag in event (or empty value) | Add `["binding", bindingId]` tag |
+| `missing_evm_tag` | 2 | No `evm` tag in event (or empty value) | Add `["evm", evmAddress]` tag |
 | `nostr_pubkey_mismatch` | 3 | `event.pubkey` ≠ `npub` | Use correct pubkey |
 | `invalid_binding_id` | 3.5 | `bindingId` is not a valid UUID v4 | Generate a fresh UUID v4 |
 | `invalid_nostr_signature` | 4 | Schnorr sig invalid or id mismatch | Re-sign event with correct nsec |
 | `invalid_content_json` | 5 | `event.content` not valid JSON | Fix content serialisation |
 | `invalid_claim_fields` | 5 | Missing field in claim object | Include all required claim fields |
 | `evm_address_invalid` | 6 | Not a valid Ethereum address | Use checksummed address |
-| `evm_address_mismatch` | 7 | Address in claim ≠ address in payload | Use same address in both |
-| `binding_id_mismatch` | 8 | `claim.bindingId` ≠ `bindingId` param | Use same UUID in both |
+| `evm_address_mismatch` | 2b, 7 | Address in tag or claim ≠ address in payload | Use same address in both |
+| `binding_id_mismatch` | 2a, 8 | `binding` tag or `claim.bindingId` ≠ `bindingId` param | Use same UUID in both |
 | `invalid_evm_signature` | 9 | ERC-1271 call returned false | Re-sign consent message |
 | `rate_limited` | — | Source IP exceeded 10 req/min | Back off and retry after 60 s |
 | `internal_error` | — | Unhandled exception | Retry / report bug |

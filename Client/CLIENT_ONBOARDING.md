@@ -239,6 +239,7 @@ reference an identical UUID before accepting the binding.
 | **XSS steals nsec** | nsec never in JS-accessible plaintext after key generation frame |
 | **IDB profile exfiltrated** | PRF: ciphertext useless without authenticator; WebCrypto: non-extractable key |
 | **User cancels CDP prompt** | nsec is persisted BEFORE signing — key is safe even on abort |
+| **Heap dump / memory scan** | nsec bytes zeroed immediately after `buildDualSignatureProof` completes in both `runOnboarding` and `runBindIdentity` — minimum lifetime in RAM |
 | **Replay attack** | 5-minute timestamp window on the server; bindingId is single-use; server cross-checks `created_at` === `timestamp` to block reuse of valid old events |
 | **Clock skew (mobile)** | Timestamp sourced from `Date.now()` — server has 300s tolerance |
 | **Key mismatch (npub/nsec)** | `buildAndSignBindingEvent` derives the public key from nsec and compares it to the provided npub before signing — throws locally on mismatch |
@@ -321,6 +322,9 @@ Consumer
    │                               │   + signMessage()  [CDP prompt]
    │                               │   ◀── evmSignature (0x…)
    │                               │
+   │                               ⑤.5 nsec.fill(0)
+   │                               │   key bytes zeroed — minimum lifetime
+   │                               │
    │                               ⑥ submitOnboarding()
    │                               │   POST /api/onboarding
    │                               │   ──▶ { npub, evmAddress, nostrEvent,
@@ -362,6 +366,7 @@ Consumer
    │                                              ② generateBindingId() + timestamp
    │                                              ③ buildAndSignBindingEvent()
    │                                              ④ signMessage() → evmSignature
+   │                                              ④.5 nsec.fill(0)  [key zeroed]
    │                                              ⑤ submitBindIdentity()
    │                                                 POST /api/bind-identity
    │                                              ⑥ publishEventToRelays()
@@ -381,6 +386,7 @@ lib/
 │
 ├── nostr/
 │   ├── keys.ts          Keypair generation (generateNostrKeypair).
+│   │                    NIP-19 encoding/decoding (toHexNpub, toDisplayNpub).
 │   │                    Binary encoding utils (toBase64, fromBase64Url, …).
 │   ├── event.ts         Kind 30078 event builder + finalizeEvent signing.
 │   └── relay.ts         Best-effort parallel event publication to relays.
@@ -396,7 +402,8 @@ lib/
 └── onboarding/
     └── flow.ts          Top-level orchestrator. The ONLY file consumers import.
                          Exports: runOnboarding, runBindIdentity, recoverNsec,
-                                  hasStoredNsec, clearStoredNsec, verifyIdentity.
+                                  hasStoredNsec, clearStoredNsec, verifyIdentity,
+                                  npubFromNsec, toHexNpub, toDisplayNpub.
 ```
 
 **Dependency rule:** Every arrow in the graph below points strictly downward.
@@ -450,6 +457,25 @@ a parameter rather than importing a specific CDP hook or SDK function.
 A React consumer passes `useSignMessage()` from `@coinbase/cdp-hooks`. A test
 passes a mock that returns a fixed hex string. Neither change requires modifying
 `flow.ts`.
+
+### Decision: nsec Zeroed Immediately After Signing
+
+In both `runOnboarding` and `runBindIdentity`, `nsec.fill(0)` is called
+immediately after `buildDualSignatureProof` returns, before any network I/O.
+
+**Why:** The Schnorr signing operation is the last step that requires the raw
+key bytes. Zeroing immediately enforces the minimum key lifetime in RAM: the
+bytes cannot be observed in a GC-delayed heap snapshot, a browser memory dump,
+or a speculative side-channel that scans live heap allocations. The pattern
+mirrors what the `CLIENT_ONBOARDING_DEV.md` instructs consumers to do after
+calling `recoverNsec` — the same discipline now applies inside the orchestrator.
+
+**Trade-off:** If any code path below `nsec.fill(0)` in the same function
+attempted to use the nsec again, it would receive zeroed bytes and produce a
+broken signature. There is no such path: the signing is complete and the nsec
+is not referenced again. The TypeScript type does not prevent use-after-zero
+(the reference is still in scope), so the zeroing call placement is a code-order
+invariant that must be maintained if the function is ever restructured.
 
 ### Decision: Relay Publication is Best-Effort with Transient-Only Retry
 

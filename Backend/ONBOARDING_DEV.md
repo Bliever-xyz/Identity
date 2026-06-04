@@ -194,7 +194,7 @@ async function validateBindingPayload(
 **Returns:**
 ```ts
 // Success
-{ valid: true, normalizedEvmAddress: string, claim: NostrBindingClaim }
+{ valid: true, normalizedEvmAddress: EvmAddressChecksummed, claim: NostrBindingClaim }
 
 // Failure
 { valid: false, reason: BindingErrorReason }
@@ -274,7 +274,7 @@ connections are maintained.
 ### 3.6 `lib/evm/verification.ts`
 
 ```ts
-function safeNormalizeAddress(address: string): string | null
+function safeNormalizeAddress(address: string): EvmAddressChecksummed | null
 
 async function verifyEVMSignature(
   message: string,
@@ -284,7 +284,10 @@ async function verifyEVMSignature(
 ```
 
 **`safeNormalizeAddress`:** Calls `viem.getAddress` (EIP-55 checksum). Returns
-`null` for invalid addresses instead of throwing.
+a branded `EvmAddressChecksummed` for valid addresses, or `null` for invalid
+inputs. The branded return type propagates through `ValidationOk.normalizedEvmAddress`,
+guaranteeing every address that exits the validator has passed through viem's
+checksum normalisation.
 
 **`verifyEVMSignature`:** Calls `viem.verifyMessage` with the public client.
 

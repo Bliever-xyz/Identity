@@ -172,7 +172,7 @@ This alignment is intentional and must not change.
 
 ### 3.3 `lib/nostr/keys.ts`
 
-**Role:** Keypair generation + binary encoding utilities.
+**Role:** Keypair generation + NIP-19 encoding/decoding + binary encoding utilities.
 
 ```ts
 // Keypair generation
@@ -180,11 +180,22 @@ function generateNostrKeypair(): NostrKeypair
 // Returns { nsec: Uint8Array[32], npub: string (64 hex chars) }
 // Entropy: crypto.getRandomValues via nostr-tools generateSecretKey()
 
-function npubFromNsec(nsec: Uint8Array): string
-// Derives the hex public key from a raw secret key.
+function npubFromNsec(nsec: Uint8Array): NostrPubkeyHex
+// Derives the branded hex public key from a raw secret key.
 // Throws immediately if nsec.length !== 32 — catches truncated or
 // corrupted key material before it reaches the cryptographic layer.
+// Returns NostrPubkeyHex (branded) — safe to pass anywhere the type is required.
 // Used after recovering nsec from storage.
+
+// NIP-19 bech32 encoding/decoding
+function toHexNpub(input: string): NostrPubkeyHex
+// Accepts either a 64-char hex pubkey or an npub1… bech32 string.
+// Validates hex format with regex; validates bech32 via nip19.decode checksum.
+// Throws on invalid input. Use at API/UI boundaries when accepting user input.
+
+function toDisplayNpub(hexNpub: NostrPubkeyHex): string
+// Converts a branded hex public key to an npub1… bech32 string for display.
+// Exact inverse of toHexNpub: toHexNpub(toDisplayNpub(hex)) === hex.
 
 // Binary encoding (used by nsec-storage.ts)
 function toBase64(bytes: Uint8Array): string
@@ -195,6 +206,11 @@ function fromBase64Url(str: string): Uint8Array
 
 **Implementation note on toBase64:** Uses chunked `String.fromCharCode` instead
 of spreading the full array, preventing a stack overflow on large buffers.
+
+**NIP-19 note:** `toHexNpub` handles both input forms so callers do not need to
+pre-check the format. The function is the correct entry point whenever accepting
+npub values from user input (paste, URL param, relay data). `toDisplayNpub` is
+the counterpart for rendering an identity in profile pages and share flows.
 
 ---
 
@@ -440,6 +456,7 @@ Full execution sequence:
 | 4 | `buildAndSignBindingEvent(…)` | No | Schnorr signature via nostr-tools |
 | 5 | `buildEVMConsentMessage(…)` | No | Deterministic string builder |
 | 6 | `signMessage(consentMessage)` | CDP prompt | Returns `0x…` EIP-191 sig |
+| 6.5 | `nsec.fill(0)` | No | Zeroes key bytes immediately after signing — minimum lifetime |
 | 7 | `submitOnboarding(payload)` | Yes | POST /api/onboarding + ERC-1271 RPC |
 | 8 | `publishEventToRelays(…)` | Yes (best-effort) | Per-relay retry with linear backoff; failure logs warning, does not throw |
 
@@ -517,9 +534,11 @@ import {
   verifyIdentity,      // POST /api/verify-identity — Nostr-only proof check
 } from "lib/onboarding/flow";
 
-// ── Key utility ────────────────────────────────────────────────────────────
+// ── Key utilities ──────────────────────────────────────────────────────────
 import {
-  npubFromNsec,        // Derive npub from recovered nsec
+  npubFromNsec,        // Derive NostrPubkeyHex from recovered nsec
+  toHexNpub,           // Convert user-supplied npub1… or hex → NostrPubkeyHex
+  toDisplayNpub,       // Convert NostrPubkeyHex → npub1… bech32 for display
 } from "lib/onboarding/flow";
 
 // ── Error class ────────────────────────────────────────────────────────────
@@ -583,10 +602,14 @@ const handle: NsecStorageHandle = JSON.parse(
 if (handle && await hasStoredNsec()) {
   // Triggers biometric if strategy === "prf"
   const nsec = await recoverNsec(handle, { rpId: "app.bliever.io" });
-  const npub = npubFromNsec(nsec);
+  const npub = npubFromNsec(nsec); // returns NostrPubkeyHex (branded)
 
-  // Use nsec for signing social events via nostr-tools
-  // Zeroize when done: nsec.fill(0)
+  // Use npub for signing social events via nostr-tools.
+  // Display the identity in the UI:
+  const displayNpub = toDisplayNpub(npub); // → "npub1xxxxxxxx…"
+
+  // Zero nsec bytes when done — do not store in component state.
+  nsec.fill(0);
 }
 ```
 
@@ -648,9 +671,31 @@ if (result.valid) {
 
 ## 7. Extending the System
 
-### Adding a new nsec storage strategy
+### Accepting user-supplied npub values
 
-1. Add the new literal to `NsecStorageStrategy` in `schema.ts`:
+Use `toHexNpub` at every boundary where the application receives an npub from
+outside the system (user paste, URL param, Nostr relay data):
+
+```ts
+import { toHexNpub, toDisplayNpub } from "lib/onboarding/flow";
+
+// At the input boundary — validate and brand
+let hexNpub: NostrPubkeyHex;
+try {
+  hexNpub = toHexNpub(userInput); // accepts hex or npub1…
+} catch {
+  showError("Invalid Nostr identity — expected npub1… or 64-char hex.");
+  return;
+}
+
+// For display
+const displayNpub = toDisplayNpub(hexNpub); // → "npub1xxxxxxxx…"
+```
+
+Once converted, the branded `NostrPubkeyHex` can be passed to any function
+that requires it without further format checks.
+
+### Adding a new nsec storage strategy
    ```ts
    export type NsecStorageStrategy = "prf" | "webcrypto" | "your_strategy";
    ```
@@ -703,6 +748,8 @@ const timestamp = now; // server unix seconds, not local Date.now()
 - Store the raw `nsec` (Uint8Array) in React state, localStorage, or cookies.
 - Log the `nsec` or any field of `NostrKeypair`.
 - Reuse a `bindingId` across multiple submission attempts.
+- Pass nsec bytes to any function after calling `nsec.fill(0)` — the bytes are
+  zeroed and the key is no longer usable.
 
 ### What the consumer receives
 

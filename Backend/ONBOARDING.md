@@ -243,6 +243,7 @@ only the most recent binding.
 | **Relay spam / fake bindings** | Backend ignores events not backed by a valid ERC-1271 signature |
 | **Endpoint abuse / DoS** | Per-IP rate limiting (10 req/min) on write endpoints blocks cheap flooding before any cryptographic work is done |
 | **RPC provider outage** | Three-tier fallback transport (primary → secondary → public) ensures ERC-1271 calls survive single-provider failures |
+| **Heap dump / memory scan** | nsec bytes zeroed immediately after Schnorr signing completes — minimum lifetime in browser RAM |
 | **CDP session compromise** | nsec encrypted with WebAuthn PRF, not derived from CDP session |
 | **Server-side key exposure** | Server never handles private keys; only public keys and signatures travel to backend |
 | **Device clock drift** | The 5-minute window tolerates typical NTP drift, but devices with manually-set clocks that are off by more than 5 minutes will fail onboarding. The client should fetch server time before generating the payload if clock accuracy cannot be assumed (common on mobile). |

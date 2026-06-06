@@ -373,6 +373,30 @@ Consumer
    │◀── BindIdentityResult
 ```
 
+### Reading Events — fetchNostrEvents
+
+Used before enabling SocialFi features (e.g. fetching Alice's binding event to
+show the Tip button on her profile), or to load any Nostr content for display.
+
+```
+Consumer
+   │
+   │── { relayUrls, authors: [aliceNpub], kinds: [30078] }
+   │                    ──▶ fetchNostrEvents()
+   │                              │
+   │                    ① validate relay URLs (wss:// only)
+   │                    ② SimplePool.subscribeMany()
+   │                    │   ├── wss://relay1 ──▶ events
+   │                    │   └── wss://relay2 ──▶ events
+   │                    ③ verifyEvent() each received event
+   │                    │   (drops unsigned / malformed events)
+   │                    ④ EOSE received → close subscription + pool
+   │                    ⑤ sort newest-first
+   │◀── NostrBindingEvent[]  (verified, sorted)
+│
+│── POST /api/verify-identity  (optional: confirm binding server-side)
+```
+
 ---
 
 ## 9. Module Responsibility Map
@@ -380,7 +404,8 @@ Consumer
 ```
 lib/
 ├── binding/
-│   ├── schema.ts        Constants + all types. Import from here; never hardcode.
+│   ├── schema.ts        Constants + all types (including client-only flow types).
+│   │                    Import from here; never hardcode constants or duplicate types.
 │   └── message.ts       Deterministic EVM consent message builder.
 │                        ⚠️  MUST be byte-identical to the server copy.
 │
@@ -389,7 +414,9 @@ lib/
 │   │                    NIP-19 encoding/decoding (toHexNpub, toDisplayNpub).
 │   │                    Binary encoding utils (toBase64, fromBase64Url, …).
 │   ├── event.ts         Kind 30078 event builder + finalizeEvent signing.
-│   └── relay.ts         Best-effort parallel event publication to relays.
+│   └── relay.ts         NIP-01 relay interactions: publish + subscribe.
+│                        publishEventToRelays — parallel best-effort write.
+│                        fetchNostrEvents — SimplePool-based verified read.
 │
 ├── crypto/
 │   └── nsec-storage.ts  Encrypted nsec persistence to IndexedDB.
@@ -422,6 +449,10 @@ flow.ts
   └── api/client.ts
         └── binding/schema.ts
 ```
+
+`fetchNostrEvents` is exported directly from `nostr/relay.ts` for consumers
+that need to read events (e.g. loading Alice's binding event before showing the
+Tip button) without going through the onboarding orchestrator.
 
 ---
 

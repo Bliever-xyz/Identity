@@ -108,17 +108,20 @@ interface NostrBindingEvent    // Nostr event shape (matches finalizeEvent outpu
 interface NostrBindingClaim    // JSON embedded in event.content
 type HexString                 // `0x${string}`
 
-// Client-only types
+// Client-only types — defined here, used by flow.ts and nsec-storage.ts
 interface NostrKeypair         // { nsec: Uint8Array, npub: string }
 type NsecStorageStrategy       // "prf" | "webcrypto"
-interface NsecStorageHandle    // Opaque reference to IDB record
+interface NsecStorageHandle    // { strategy, credentialId? } — safe to store in localStorage
 type SignMessageFn             // (message: string) => Promise<HexString>
 
-// Flow parameter types
+// Flow parameter types — all in schema.ts; flow.ts imports from here
 interface OnboardingParams     // Input to runOnboarding()
 interface OnboardingResult     // Output of runOnboarding()
 interface BindIdentityParams   // Input to runBindIdentity()
 interface BindIdentityResult   // Output of runBindIdentity()
+
+// Error codes — exhaustive union used by both client and server
+type BindingErrorReason        // includes "rate_limited" for 429 responses
 ```
 
 **Sync requirement:** Any constant tagged `[SERVER-MIRROR]` must be updated in
@@ -264,7 +267,10 @@ The server's `checkNostrEventStructure` validates the presence and non-empty val
 
 ### 3.5 `lib/nostr/relay.ts`
 
-**Role:** Best-effort parallel publication of the signed event to Nostr relays.
+**Role:** NIP-01 relay interactions — event publication and event subscription.
+This module covers the complete read/write lifecycle for Nostr events on the client.
+
+#### Publication — `publishEventToRelays`
 
 ```ts
 interface RelayPublishOutcome {
@@ -300,6 +306,54 @@ async function publishEventToRelays(
 **Caller contract:** `flow.ts` calls this after the backend confirms the binding.
 A `PublishResult` where `atLeastOneSuccess === false` logs a warning but does NOT
 cause `runOnboarding` to reject. The consumer can re-publish using `result.nostrEvent`.
+
+#### Subscription — `fetchNostrEvents`
+
+```ts
+interface FetchEventsParams {
+  relayUrls: string[];   // wss:// or ws:// WebSocket URLs
+  authors?: string[];    // 64-char hex public keys to filter by
+  kinds?: number[];      // Nostr event kinds (e.g. [1, 30078])
+  since?: number;        // unix timestamp — only events after this
+  until?: number;        // unix timestamp — only events before this
+  limit?: number;        // max events per relay (default 50)
+}
+
+async function fetchNostrEvents(
+  params: FetchEventsParams,
+): Promise<NostrBindingEvent[]>
+```
+
+Reads stored events from one or more relays using nostr-tools `SimplePool`.
+A `SimplePool` manages multiple WebSocket connections concurrently and merges
+results, so a slow or offline relay does not block delivery from the others.
+
+**Implementation details:**
+
+- URLs are validated with the same `isValidRelayUrl` guard used by `publishEventToRelays`. Invalid URLs are skipped immediately with a console warning.
+- `SimplePool.subscribeMany` sends a NIP-01 REQ with the supplied filter to all valid relays in parallel.
+- Every event received via `onevent` is passed through `verifyEvent` (id integrity + Schnorr signature check) before being added to the result set. Events that fail verification are dropped with a `console.warn` — a malicious relay should not surface forged data.
+- The subscription resolves on `oneose` (End of Stored Events), at which point `sub.close()` is called and the pool is fully closed in a `finally` block.
+- Results are sorted newest-first (`created_at` descending) for consistent consumer behaviour.
+- On any unexpected error the function returns an empty array and logs via `console.error` — it never throws.
+
+**Typical usage — load a user's binding event before enabling the Tip button:**
+
+```ts
+import { fetchNostrEvents } from "lib/nostr/relay";
+
+const events = await fetchNostrEvents({
+  relayUrls: ["wss://relay.damus.io", "wss://nos.lol"],
+  authors: [aliceNpub],
+  kinds: [30078],
+  limit: 1,
+});
+// events[0] is Alice's most recent binding event (if any)
+```
+
+**NIP-01 lifecycle completeness:** together with `buildAndSignBindingEvent` (create)
+and `publishEventToRelays` (publish), `fetchNostrEvents` completes the full
+NIP-01 event lifecycle on the client: **Create → Publish → Verify → Read**.
 
 ---
 
@@ -545,6 +599,12 @@ import {
 import {
   OnboardingApiError,  // { reason: BindingErrorReason, status: number }
 } from "lib/onboarding/flow";
+
+// ── Relay reading (import directly — not re-exported through flow.ts) ──────
+import {
+  fetchNostrEvents,    // SimplePool-based verified event fetch
+  type FetchEventsParams,
+} from "lib/nostr/relay";
 ```
 
 ---
@@ -706,11 +766,11 @@ that requires it without further format checks.
 
 ### Adding a new relay publication strategy
 
-Currently `relay.ts` uses `Relay.connect()` + `relay.publish()` from nostr-tools.
-To support authenticated relays (NIP-42) or pool-based connections:
+`relay.ts` uses `Relay.connect()` + `relay.publish()` for writes and `SimplePool`
+for reads. To support authenticated relays (NIP-42) or replace either transport:
 
-1. Create `lib/nostr/relay-pool.ts` implementing the same `PublishResult` interface.
-2. Pass a `publishFn` parameter into `flow.ts` to swap implementations.
+1. For writes: add an alternative publish function to `relay.ts` implementing the same `PublishResult` interface. Pass a `publishFn` parameter into `flow.ts` to swap implementations.
+2. For reads: extend `FetchEventsParams` with an `auth` callback and handle NIP-42 AUTH messages inside `fetchNostrEvents` before the EOSE resolves.
 
 ### Supporting a new consent message version
 
@@ -895,6 +955,13 @@ console.log(publishResult.outcomes);
 ```
 
 Common causes: malformed URL (http:// instead of wss://), relay offline, WebSocket blocked by corporate firewall, relay requires NIP-42 authentication. Check `outcomes[n].error` — invalid URLs are identified immediately with a descriptive message rather than a timeout. Add more relay URLs for resilience.
+
+### `fetchNostrEvents` returns an empty array
+
+1. **All relay URLs invalid** — The function skips any URL that does not parse as `wss://` or `ws://` and warns to the console. Verify the URLs passed in `relayUrls`.
+2. **Filter too narrow** — If `authors`, `kinds`, `since`, and `until` are all set, the combined filter may match nothing. Relax constraints and retry.
+3. **EOSE received before events arrive** — Some relays send EOSE immediately if they have no matching stored events. This is valid relay behaviour; try a different relay or remove the `since` constraint.
+4. **Event verification failed** — If a relay returns events that `verifyEvent` rejects, they are dropped silently. A `console.warn` is emitted for each dropped event with its `id`. Check the browser console to distinguish "no events found" from "events found but invalid".
 
 ### Rate limit (429) during development / automated testing
 

@@ -316,8 +316,9 @@ Browser                       CDP                    Backend              Base R
 ```
 Browser                     Nostr Relay              Backend
    │                             │                       │
-   │── fetch Kind 30078 event ──▶│                       │
-   │◀─ { id, pubkey, sig, ... } ─│                       │
+   │── fetchNostrEvents() ───────▶│                       │
+   │   (SimplePool, verified)     │                       │
+   │◀─ NostrBindingEvent[] ───────│                       │
    │                             │                       │
    │────── POST /api/verify-identity ─────────────────▶  │
    │                             │                       │── verifyEvent() (local)

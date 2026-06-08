@@ -13,7 +13,7 @@
    - [lib/binding/schema.ts](#31-libbindingschema-ts)
    - [lib/binding/message.ts](#32-libbindingmessage-ts)
    - [lib/binding/validator.ts](#33-libbindingvalidator-ts)
-   - [lib/nostr/verification.ts](#34-libnostrverification-ts)
+   - [lib/nostr/nip01-basic/verification.ts](#34-libnostrnip01-basicverification-ts)
    - [lib/evm/client.ts](#35-libevmclient-ts)
    - [lib/evm/verification.ts](#36-libevmverification-ts)
 4. [API Routes](#4-api-routes)
@@ -33,23 +33,40 @@
 ```
 lib/
 ├── binding/
-│   ├── schema.ts       ← All types, constants, response shapes
-│   ├── message.ts      ← Deterministic EVM consent message builder
-│   └── validator.ts    ← Core validation logic (pure + async)
-├── nostr/
-│   └── verification.ts ← Nostr Schnorr signature verification
+│   ├── schema.ts            ← All types, constants, response shapes
+│   ├── message.ts           ← Deterministic EVM consent message builder
+│   └── validator.ts         ← Core validation logic (pure + async)
+│
+├── nostr/                   ← NIP-by-NIP modular protocol library
+│   ├── index.ts             ← Master barrel re-export for the whole Nostr library
+│   │
+│   ├── nip01-basic/         ← NIP-01: keypairs, event building, relay pub/sub
+│   │   ├── keys.ts          ← Keypair generation, NIP-19 encoding, binary helpers
+│   │   ├── event.ts         ← Kind 30078 binding event builder + finalizer
+│   │   ├── relay.ts         ← Publish (Relay) + read/subscribe (SimplePool)
+│   │   ├── verification.ts  ← Schnorr signature verifier (nostr-tools/pure)
+│   │   └── index.ts         ← Re-exports public API for nip01-basic
+│   │
+│   └── nip09-deletions/     ← NIP-09: Kind 5 tombstone events (coming soon)
+│       └── index.ts         ← Placeholder — builder and schema added here
+│
+├── crypto/
+│   └── nsec-storage.ts      ← WebAuthn PRF + IndexedDB nsec encryption
+│
 └── evm/
-    ├── client.ts       ← Viem public client (Base chain)
-    └── verification.ts ← EVM ERC-1271 signature verification
+    ├── client.ts            ← Viem public client (Base chain)
+    └── verification.ts      ← EVM ERC-1271 signature verification
 
 app/api/
 ├── onboarding/
-│   └── route.ts        ← POST /api/onboarding
+│   └── route.ts             ← POST /api/onboarding
 ├── bind-identity/
-│   └── route.ts        ← POST /api/bind-identity
+│   └── route.ts             ← POST /api/bind-identity
 └── verify-identity/
-    └── route.ts        ← POST /api/verify-identity
+    └── route.ts             ← POST /api/verify-identity
 ```
+
+**NIP-by-NIP design rationale:** Each subfolder owns the schema, builders, and resolvers for exactly one Nostr protocol extension. Zero coupling between NIPs — upgrading or testing NIP-09 never touches NIP-01 files. The folder structure maps 1:1 with the official NIPs repository.
 
 **Dependency graph (no cycles):**
 
@@ -58,9 +75,9 @@ route.ts
   └── validator.ts
         ├── schema.ts
         ├── message.ts
-        ├── nostr/verification.ts  ← nostr-tools/pure
+        ├── nostr/nip01-basic/verification.ts  ← nostr-tools/pure
         └── evm/verification.ts
-              └── evm/client.ts    ← viem
+              └── evm/client.ts                ← viem
 ```
 
 ---
@@ -223,7 +240,7 @@ Steps 1–8 are all local. Only step 9 hits the network.
 
 ---
 
-### 3.4 `lib/nostr/verification.ts`
+### 3.4 `lib/nostr/nip01-basic/verification.ts`
 
 ```ts
 async function verifyNostrEvent(event: NostrBindingEvent): Promise<boolean>
@@ -289,7 +306,7 @@ inputs. The branded return type propagates through `ValidationOk.normalizedEvmAd
 guaranteeing every address that exits the validator has passed through viem's
 checksum normalisation.
 
-**`verifyEVMSignature`:** Calls `viem.verifyMessage` with the public client.
+**`verifyEVMSignature`:** Calls `viem.verifyMessage` with the public client as the first positional argument (viem v2 API): `verifyMessage(client, { address, message, signature })`.
 
 viem's `verifyMessage` behaviour:
 
@@ -557,8 +574,8 @@ claim.bindingId === bindingId
 
 **Step 9 — ERC-1271 on-chain (viem)**
 ```ts
-verifyMessage({
-  client: basePublicClient,          // triggers isValidSignature eth_call
+// viem v2: client is the first positional argument, not a property.
+verifyMessage(basePublicClient, {
   address: normalizedExpected,
   message: buildEVMConsentMessage(npub, bindingId, timestamp),
   signature: evmSignature,
@@ -618,14 +635,29 @@ Then insert the call into `validateBindingPayload` **before** the ERC-1271 call
 
 Add the new reason code to `BindingErrorReason` in `schema.ts`.
 
-### Supporting a new Nostr event kind
+### Supporting a new Nostr event kind (NIP-by-NIP pattern)
 
-1. Add a new constant in `schema.ts`:
-   ```ts
-   export const NOSTR_BACKUP_KIND = 30078; // different d-tag
+Each new Nostr protocol extension gets its own folder under `lib/nostr/`. This ensures zero coupling between NIPs — the logic for one event kind never bleeds into another.
+
+1. Create the NIP folder:
    ```
-2. Add a new validator in `validator.ts`.
-3. Add a new route if the payload shape differs.
+   lib/nostr/nipXX-name/
+   ├── schema.ts    ← Types, constants, tag definitions specific to this NIP
+   ├── builder.ts   ← Event construction (calls finalizeEvent)
+   └── index.ts     ← Re-exports public API for this NIP
+   ```
+2. Add a new constant in `lib/binding/schema.ts` if the new kind participates in the binding system:
+   ```ts
+   export const NOSTR_PROFILE_KIND = 0 as const;
+   ```
+3. Add a new validator in `lib/binding/validator.ts` if server-side verification is needed.
+4. Add a new route under `app/api/` if the payload shape differs.
+5. Export from `lib/nostr/index.ts`:
+   ```ts
+   export * from "./nipXX-name";
+   ```
+
+**NIP-09 (Kind 5 Deletions)** is pre-stubbed at `lib/nostr/nip09-deletions/index.ts`. Add `schema.ts` and `builder.ts` there when implementing.
 
 ### Supporting multiple chains
 

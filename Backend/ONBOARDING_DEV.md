@@ -89,7 +89,7 @@ route.ts
 | Package | Version | Used For |
 |---------|---------|----------|
 | `nostr-tools` | ≥ 2.x | `verifyEvent` (Schnorr signature + event id check) |
-| `viem` | ≥ 2.x | `verifyMessage` (ERC-1271), `getAddress` (EIP-55) |
+| `viem` | ≥ 2.x | `publicClient.verifyMessage` (ERC-1271), `getAddress` (EIP-55) |
 | `next` | ≥ 14.x | `NextRequest`, `NextResponse` route handlers |
 
 ### Sub-path imports
@@ -306,7 +306,7 @@ inputs. The branded return type propagates through `ValidationOk.normalizedEvmAd
 guaranteeing every address that exits the validator has passed through viem's
 checksum normalisation.
 
-**`verifyEVMSignature`:** Calls `viem.verifyMessage` with the public client as the first positional argument (viem v2 API): `verifyMessage(client, { address, message, signature })`.
+**`verifyEVMSignature`:** Calls `basePublicClient.verifyMessage(...)` — the viem v2 pattern of invoking actions as methods on the client instance. This natively handles both EOA ecrecover and ERC-1271 on-chain verification without any additional configuration.
 
 viem's `verifyMessage` behaviour:
 
@@ -574,8 +574,8 @@ claim.bindingId === bindingId
 
 **Step 9 — ERC-1271 on-chain (viem)**
 ```ts
-// viem v2: client is the first positional argument, not a property.
-verifyMessage(basePublicClient, {
+// viem v2: actions are called as methods on the client instance.
+basePublicClient.verifyMessage({
   address: normalizedExpected,
   message: buildEVMConsentMessage(npub, bindingId, timestamp),
   signature: evmSignature,
